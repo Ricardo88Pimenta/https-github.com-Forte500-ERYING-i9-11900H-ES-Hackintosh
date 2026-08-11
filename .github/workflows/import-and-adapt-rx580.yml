@@ -1,0 +1,189 @@
+name: Import and adapt EFI for RX 580
+
+on:
+  push:
+    paths:
+      - '.github/workflows/import-and-adapt-rx580.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-efi:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout target repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Clone Forte500 upstream
+        run: |
+          rm -rf /tmp/erying-upstream
+          git clone --depth 1 https://github.com/Forte500/ERYING-i9-11900H-ES-Hackintosh.git /tmp/erying-upstream
+          echo "UPSTREAM_COMMIT=$(git -C /tmp/erying-upstream rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Import upstream EFI
+        run: |
+          rm -rf EFI
+          cp -a /tmp/erying-upstream/EFI ./EFI
+
+      - name: Adapt OpenCore config for RX 580 and stock THM570 BIOS
+        shell: python
+        run: |
+          import plistlib
+          from pathlib import Path
+
+          path = Path('EFI/OC/config.plist')
+          with path.open('rb') as f:
+              cfg = plistlib.load(f)
+
+          # Keep the Tiger Lake i9-11900H ES CPU spoof/power-management settings
+          # from Forte500. Only adapt GPU-specific and stock-BIOS-specific items.
+
+          # 1) RX 580 (Polaris) does not need agdpmod=pikera. Keep the Intel Xe
+          # iGPU in VESA/disabled mode and prefer the external AMD GPU.
+          nvram = cfg.setdefault('NVRAM', {}).setdefault('Add', {})
+          apple_nvram = nvram.setdefault('7C436110-AB2A-4BBB-A880-FE41995C9F82', {})
+          args = apple_nvram.get('boot-args', '')
+          tokens = [t for t in args.split() if t not in {'agdpmod=pikera', '-wegnoegpu'}]
+          for required in ['-igfxvesa', '-wegswitchgpu']:
+              if required not in tokens:
+                  tokens.append(required)
+          apple_nvram['boot-args'] = ' '.join(tokens)
+
+          # 2) Remove the RX 6600 XT cosmetic model injection. Let macOS/
+          # WhateverGreen identify the RX 580 naturally.
+          dev_add = cfg.setdefault('DeviceProperties', {}).setdefault('Add', {})
+          empty_paths = []
+          for pci_path, props in list(dev_add.items()):
+              if not isinstance(props, dict):
+                  continue
+              model = props.get('model')
+              model_text = ''
+              if isinstance(model, bytes):
+                  try:
+                      model_text = model.decode('utf-8', errors='ignore')
+                  except Exception:
+                      model_text = ''
+              elif isinstance(model, str):
+                  model_text = model
+              if '6600' in model_text.lower():
+                  props.pop('model', None)
+              if not props:
+                  empty_paths.append(pci_path)
+          for pci_path in empty_paths:
+              dev_add.pop(pci_path, None)
+
+          # 3) RX 580 is not a ReBAR target. Disable OpenCore GPU BAR resizing
+          # when those keys exist. BIOS Re-Size BAR should also be disabled for
+          # the first boot with this Polaris card.
+          booter_quirks = cfg.setdefault('Booter', {}).setdefault('Quirks', {})
+          if 'ResizeAppleGpuBars' in booter_quirks:
+              booter_quirks['ResizeAppleGpuBars'] = -1
+          uefi_quirks = cfg.setdefault('UEFI', {}).setdefault('Quirks', {})
+          if 'ResizeGpuBars' in uefi_quirks:
+              uefi_quirks['ResizeGpuBars'] = -1
+
+          # 4) Force the stock THM570111 USB map and leave Lightning BIOS map off.
+          kernel_add = cfg.setdefault('Kernel', {}).setdefault('Add', [])
+          for entry in kernel_add:
+              if not isinstance(entry, dict):
+                  continue
+              bundle = entry.get('BundlePath', '')
+              if bundle == 'UTBMap111.kext':
+                  entry['Enabled'] = True
+              elif bundle == 'UTBMap10729.kext':
+                  entry['Enabled'] = False
+
+          # 5) Keep iMacPro1,1, but never ship the public upstream SMBIOS identity.
+          # The user must generate unique values with GenSMBIOS before iServices.
+          generic = cfg.setdefault('PlatformInfo', {}).setdefault('Generic', {})
+          generic['SystemProductName'] = 'iMacPro1,1'
+          generic['SystemSerialNumber'] = 'GENERATE_WITH_GENSMBIOS'
+          generic['MLB'] = 'GENERATE_WITH_GENSMBIOS'
+          generic['SystemUUID'] = '00000000-0000-0000-0000-000000000000'
+          generic['ROM'] = bytes.fromhex('000000000000')
+
+          with path.open('wb') as f:
+              plistlib.dump(cfg, f, fmt=plistlib.FMT_XML, sort_keys=False)
+
+          print('Patched:', path)
+          print('boot-args:', apple_nvram['boot-args'])
+          print('SMBIOS:', generic['SystemProductName'])
+
+      - name: Validate plist and expected RX 580 changes
+        run: |
+          python3 - <<'PY'
+          import plistlib
+          from pathlib import Path
+          p = Path('EFI/OC/config.plist')
+          with p.open('rb') as f:
+              c = plistlib.load(f)
+          args = c['NVRAM']['Add']['7C436110-AB2A-4BBB-A880-FE41995C9F82']['boot-args'].split()
+          assert 'agdpmod=pikera' not in args
+          assert '-wegswitchgpu' in args
+          assert '-igfxvesa' in args
+          assert c['PlatformInfo']['Generic']['SystemProductName'] == 'iMacPro1,1'
+          maps = {x.get('BundlePath'): x.get('Enabled') for x in c['Kernel']['Add']}
+          assert maps.get('UTBMap111.kext') is True
+          assert maps.get('UTBMap10729.kext') is False
+          print('config.plist XML and RX580 checks: OK')
+          PY
+
+      - name: Write hardware and BIOS notes
+        run: |
+          cat > RX580-NOTES.md <<EOF
+          # EFI adaptada — ERYING THM570 + i9-11900H ES + RX 580
+
+          Upstream: Forte500/ERYING-i9-11900H-ES-Hackintosh  
+          Upstream commit: \`${UPSTREAM_COMMIT}\`
+
+          ## Hardware alvo
+          - ERYING THM570 / THM5701xx
+          - Intel Core i9-11900H ES (Tiger Lake-H)
+          - 16 GB DDR4-3200
+          - AMD Radeon RX 580 (Polaris)
+          - Kingston SSD SATA 480 GB
+
+          ## Alterações em relação à EFI do Forte500
+          - removido \`agdpmod=pikera\` (específico/útil para Navi; não necessário na RX 580)
+          - removida a injeção cosmética de modelo \`RX 6600 XT\`
+          - mantidos \`-igfxvesa\` e \`-wegswitchgpu\` para neutralizar a Intel Xe e usar a Radeon dedicada
+          - \`UTBMap111.kext\` habilitado para BIOS stock THM570111
+          - \`UTBMap10729.kext\` desabilitado
+          - redimensionamento de GPU BAR do OpenCore colocado em modo desabilitado quando presente
+          - SMBIOS mantido como \`iMacPro1,1\`, mas números públicos do upstream foram removidos
+
+          ## BIOS recomendada para o primeiro boot
+          - SATA Mode: **AHCI**
+          - XHCI Hand-off: **Enabled**
+          - CFG Lock: **Disabled**
+          - Overclocking Lock: **Disabled**
+          - VT-d: **Enabled**
+          - Internal Graphics: **Auto**
+          - Primary Display: **Auto / PEG se disponível e estável**
+          - Fast Boot: **Disabled**
+          - Secure Boot: **Disabled**
+          - Re-Size BAR: **Disabled inicialmente para a RX 580**
+
+          ## Antes de usar iCloud / iMessage / FaceTime
+          O arquivo \`EFI/OC/config.plist\` foi deliberadamente deixado sem uma identidade Apple reutilizada. Gere valores **únicos** de \`SystemSerialNumber\`, \`MLB\`, \`SystemUUID\` e \`ROM\` para \`iMacPro1,1\` com GenSMBIOS antes de usar iServices.
+
+          ## Observação
+          Sleep continua sendo uma limitação conhecida desta plataforma/BIOS. A EFI foi preparada para boot e uso como desktop; não foi alterado o conjunto de patches de CPU/ACPI do Forte500.
+          EOF
+
+      - name: Commit imported and adapted EFI
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add EFI RX580-NOTES.md
+          if git diff --cached --quiet; then
+            echo 'No changes to commit.'
+            exit 0
+          fi
+          git commit -m 'adapt EFI for ERYING i9-11900H ES and RX 580'
+          git push origin HEAD:main
