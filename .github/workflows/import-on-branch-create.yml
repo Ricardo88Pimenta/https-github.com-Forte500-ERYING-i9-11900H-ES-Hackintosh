@@ -1,0 +1,41 @@
+name: Import EFI on branch create
+
+on:
+  create:
+
+permissions:
+  contents: write
+
+jobs:
+  import-and-patch:
+    if: github.ref_type == 'branch' && github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Clone Forte500 upstream
+        run: |
+          rm -rf /tmp/erying-upstream
+          git clone --depth 1 https://github.com/Forte500/ERYING-i9-11900H-ES-Hackintosh.git /tmp/erying-upstream
+          echo "UPSTREAM_COMMIT=$(git -C /tmp/erying-upstream rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Import upstream EFI
+        run: |
+          rm -rf EFI
+          cp -a /tmp/erying-upstream/EFI ./EFI
+
+      - name: Patch for RX 580
+        run: python3 scripts/adapt_rx580.py
+
+      - name: Commit EFI to main
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add EFI RX580-NOTES.md
+          git diff --cached --quiet && exit 0
+          git commit -m 'adapt EFI for ERYING i9-11900H ES and RX 580'
+          git push origin HEAD:main
